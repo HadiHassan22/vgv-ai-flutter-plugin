@@ -42,6 +42,7 @@ hooks/
     format.sh          # Runs dart format on modified .dart files
     vgv-cli-common.sh  # Shared utilities for VGV CLI hook scripts
     warn-missing-mcp.sh  # Warns at session start if VGV CLI is missing/outdated
+    warn-missing-mcp_test.sh  # Tests for warn-missing-mcp.sh
 skills/                  # every <skill>/ ships SKILL.md + agents/openai.yaml (Codex sidecar)
   accessibility/SKILL.md
   accessibility/references/

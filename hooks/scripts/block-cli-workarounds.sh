@@ -29,8 +29,8 @@ if [ -z "$COMMAND" ]; then
   exit 0
 fi
 
-# Deny with an install/upgrade message when the CLI is missing or outdated,
-# otherwise redirect to the MCP tool.
+# Deny with an install/upgrade message when the CLI is missing or outdated, with a PATH
+# message when it is present but cannot run, and otherwise redirect to the MCP tool.
 deny_with_cli_check() {
   local mcp_hint="$1"
   local cli_status
@@ -42,6 +42,11 @@ deny_with_cli_check() {
     outdated:*)
       local version="${cli_status#outdated:}"
       deny "Very Good CLI ${version} is too old (requires >= ${MIN_VERSION}). Update with: dart pub global activate very_good_cli"
+      ;;
+    unverifiable)
+      # Redirecting to the MCP tool here would be a dead end: the server starts through
+      # the same very_good shim, which cannot exec dart from this PATH either.
+      deny "Very Good CLI was found but could not run: dart is not on the PATH available to hooks, so the very_good_cli MCP server cannot start either. Add the Dart SDK bin directory to PATH for non-interactive shells (e.g. in ~/.zprofile) and start a new session."
       ;;
     *)
       deny "$mcp_hint"

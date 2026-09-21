@@ -3,9 +3,12 @@
 #
 # Usage: bash hooks/scripts/block-cli-workarounds_test.sh
 #
-# The hook reads a JSON payload from stdin containing tool_input.command,
-# then exits 0 with a deny JSON on stdout if blocked, or exits 0 silently
-# if allowed. We check stdout for the deny marker to determine the result.
+# The hook reads a JSON payload from stdin. It exits 0 with a deny decision on stdout
+# when the command is blocked, or exits 0 with no output when it stands aside. Every
+# case reads the decision value itself, never just the presence of a decision, and
+# treats a non-zero exit as its own outcome so a crashing hook cannot pass as
+# "stood aside". Every case runs against a stubbed very_good on a PATH that contains
+# nothing else, so results do not depend on what is installed on the machine.
 
 set -euo pipefail
 
@@ -15,49 +18,94 @@ HOOK="$SCRIPT_DIR/block-cli-workarounds.sh"
 PASSED=0
 FAILED=0
 
-# Run hook with a command and check if it was blocked or allowed.
-# Usage: run_hook "command string"
-# Returns: "blocked" or "allowed"
-run_hook() {
-  local cmd="$1"
-  local payload
-  payload=$(jq -n --arg c "$cmd" '{"tool_input":{"command":$c}}')
-  local output
-  output=$(echo "$payload" | bash "$HOOK" 2>/dev/null) || true
-  if echo "$output" | grep -q '"permissionDecision"'; then
-    echo "blocked"
+STUB_DIR="$(mktemp -d)"
+trap 'rm -rf "$STUB_DIR"' EXIT
+
+BASE_PATH="$(dirname "$(command -v jq)"):/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Install a stubbed very_good. With a version argument the stub reports that version;
+# with no argument it fails the way the real shim does when `dart` is missing from PATH.
+# Usage: stub_cli [version]
+stub_cli() {
+  local version="${1:-}"
+  local target="$STUB_DIR/very_good"
+  if [ -z "$version" ]; then
+    printf '#!/bin/sh\necho "very_good: dart: command not found" >&2\nexit 127\n' > "$target"
   else
-    echo "allowed"
+    printf '#!/bin/sh\necho "very_good %s"\n' "$version" > "$target"
   fi
+  chmod +x "$target"
+}
+
+no_cli() { rm -f "$STUB_DIR/very_good"; }
+
+# Run the hook on a payload. Sets LAST_RESULT to the permissionDecision ("deny"/"allow"),
+# "aside" when the hook exited 0 with no decision, or "exit:<status>" on a non-zero exit.
+# The full stdout is left in LAST_OUTPUT for reason assertions. These are globals rather
+# than printed values so that assertions do not have to call this in a subshell.
+LAST_OUTPUT=""
+LAST_RESULT=""
+run_hook_payload() {
+  local payload="$1"
+  local status=0
+  LAST_OUTPUT=$(printf '%s' "$payload" \
+    | env -i PATH="$STUB_DIR:$BASE_PATH" HOME="$STUB_DIR" PUB_CACHE="$STUB_DIR/pub-cache" \
+        bash "$HOOK" 2>/dev/null) || status=$?
+  if [ "$status" -ne 0 ]; then
+    LAST_RESULT="exit:$status"
+  elif [ -z "$LAST_OUTPUT" ]; then
+    LAST_RESULT="aside"
+  else
+    LAST_RESULT=$(echo "$LAST_OUTPUT" | jq -r '.hookSpecificOutput.permissionDecision // "malformed"')
+  fi
+}
+
+# Run hook with a command as the shell tool (no tool_name, the way Claude Code's
+# hooks.json matcher delivers it).
+run_hook() {
+  run_hook_payload "$(jq -n --arg c "$1" '{"tool_input":{"command":$c}}')"
 }
 
 assert_blocked() {
   local cmd="$1"
-  local result
-  result=$(run_hook "$cmd")
-  if [ "$result" = "blocked" ]; then
+  run_hook "$cmd"
+  if [ "$LAST_RESULT" = "deny" ]; then
     printf "  \033[32mPASS\033[0m  blocked:  %s\n" "$cmd"
     PASSED=$((PASSED + 1))
   else
-    printf "  \033[31mFAIL\033[0m  expected blocked but allowed:  %s\n" "$cmd"
+    printf "  \033[31mFAIL\033[0m  expected deny but got %s:  %s\n" "$LAST_RESULT" "$cmd"
     FAILED=$((FAILED + 1))
   fi
 }
 
 assert_allowed() {
   local cmd="$1"
-  local result
-  result=$(run_hook "$cmd")
-  if [ "$result" = "allowed" ]; then
+  run_hook "$cmd"
+  if [ "$LAST_RESULT" = "aside" ]; then
     printf "  \033[32mPASS\033[0m  allowed:  %s\n" "$cmd"
     PASSED=$((PASSED + 1))
   else
-    printf "  \033[31mFAIL\033[0m  expected allowed but blocked:  %s\n" "$cmd"
+    printf "  \033[31mFAIL\033[0m  expected aside but got %s:  %s\n" "$LAST_RESULT" "$cmd"
+    FAILED=$((FAILED + 1))
+  fi
+}
+
+# Assert that the last hook output's permissionDecisionReason contains a string.
+assert_reason_contains() {
+  local needle="$1" label="$2"
+  local reason
+  reason=$(echo "$LAST_OUTPUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // ""')
+  if [[ "$reason" == *"$needle"* ]]; then
+    printf "  \033[32mPASS\033[0m  reason mentions %-12s %s\n" "'$needle':" "$label"
+    PASSED=$((PASSED + 1))
+  else
+    printf "  \033[31mFAIL\033[0m  reason lacks '%s':  %s\n    got: %s\n" "$needle" "$label" "$reason"
     FAILED=$((FAILED + 1))
   fi
 }
 
 echo "=== block-cli-workarounds tests ==="
+stub_cli 1.5.0
 echo ""
 echo "--- Should be BLOCKED ---"
 assert_blocked "dart test"
@@ -93,47 +141,57 @@ echo ""
 echo "--- Tool scoping ---"
 
 # Run hook with an explicit tool_name alongside the command.
-# Returns: "blocked" or "allowed"
 run_hook_for_tool() {
-  local tool="$1"
-  local cmd="$2"
-  local payload
-  payload=$(jq -n --arg t "$tool" --arg c "$cmd" '{"tool_name":$t,"tool_input":{"command":$c}}')
-  local output
-  output=$(echo "$payload" | bash "$HOOK" 2>/dev/null) || true
-  if echo "$output" | grep -q '"permissionDecision"'; then
-    echo "blocked"
-  else
-    echo "allowed"
-  fi
+  run_hook_payload "$(jq -n --arg t "$1" --arg c "$2" '{"tool_name":$t,"tool_input":{"command":$c}}')"
 }
 
+# Usage: assert_tool_result deny|aside <tool_name> <command>
 assert_tool_result() {
   local expected="$1"
   local tool="$2"
   local cmd="$3"
-  local result
-  result=$(run_hook_for_tool "$tool" "$cmd")
-  if [ "$result" = "$expected" ]; then
+  run_hook_for_tool "$tool" "$cmd"
+  if [ "$LAST_RESULT" = "$expected" ]; then
     printf "  \033[32mPASS\033[0m  %-8s %-22s %s\n" "$expected" "$tool" "$cmd"
     PASSED=$((PASSED + 1))
   else
-    printf "  \033[31mFAIL\033[0m  expected %s but got %s:  %s / %s\n" "$expected" "$result" "$tool" "$cmd"
+    printf "  \033[31mFAIL\033[0m  expected %s but got %s:  %s / %s\n" "$expected" "$LAST_RESULT" "$tool" "$cmd"
     FAILED=$((FAILED + 1))
   fi
 }
 
 # The host's shell tool is this hook's business, whatever it is named.
-assert_tool_result blocked "Bash"  "flutter test"
-assert_tool_result blocked "Shell" "flutter test"
-assert_tool_result blocked "Bash"  "very_good create flutter_app"
+assert_tool_result deny  "Bash"  "flutter test"
+assert_tool_result deny  "Shell" "flutter test"
+assert_tool_result deny  "Bash"  "very_good create flutter_app"
 
 # Anything else is not. An unrelated MCP tool can carry a `command` argument of its own,
 # and reaches this hook on any host that does not apply the hooks.json matcher.
-assert_tool_result allowed "MCP:run_terminal_cmd" "flutter test"
-assert_tool_result allowed "MCP:browser_tabs"     "flutter test"
-assert_tool_result allowed "mcp__some-server__exec" "dart test --coverage"
-assert_tool_result allowed "Write"                "flutter test"
+assert_tool_result aside "MCP:run_terminal_cmd" "flutter test"
+assert_tool_result aside "MCP:browser_tabs"     "flutter test"
+assert_tool_result aside "mcp__some-server__exec" "dart test --coverage"
+assert_tool_result aside "Write"                "flutter test"
+
+echo ""
+echo "--- Deny reason follows the CLI status ---"
+
+stub_cli 1.5.0
+assert_blocked "flutter test"
+assert_reason_contains "MCP 'test' tool" "current CLI redirects to the MCP tool"
+
+stub_cli 1.2.9
+assert_blocked "flutter test"
+assert_reason_contains "too old" "outdated CLI asks for an update"
+
+no_cli
+assert_blocked "flutter test"
+assert_reason_contains "not found" "missing CLI asks for an install"
+
+# The MCP server starts through the same very_good shim, so redirecting to it when the
+# shim cannot exec dart would be a dead end. The reason must point at PATH instead.
+stub_cli
+assert_blocked "flutter test"
+assert_reason_contains "dart is not on the PATH" "CLI that cannot run points at PATH, not the MCP tool"
 
 echo ""
 echo "=== Results: $PASSED passed, $FAILED failed ==="

@@ -4,7 +4,8 @@
 # Usage: bash hooks/scripts/check-vgv-cli_test.sh
 #
 # The hook reads a JSON payload from stdin and either emits a decision JSON on stdout
-# (allow/deny) or exits silently, meaning it stood aside. Every case runs against a
+# (allow/deny) or exits silently, meaning it stood aside. A non-zero exit is its own
+# outcome, never mistaken for standing aside. Every case runs against a
 # stubbed very_good on a PATH that contains nothing else, so results do not depend on
 # what is installed on the machine running the tests.
 
@@ -43,17 +44,21 @@ stub_cli() {
 
 no_cli() { rm -rf "$STUB_DIR/pub-cache" "$STUB_DIR/very_good"; }
 
-# Returns the permissionDecision, or "aside" when the hook produced no decision.
+# Prints the permissionDecision ("allow"/"deny"), "aside" when the hook exited 0 with
+# no decision, or "exit:<status>" on a non-zero exit, so a crashing hook cannot pass
+# as having stood aside.
 run_hook() {
   local payload="$1"
-  local output
+  local output status=0
   output=$(printf '%s' "$payload" \
     | env -i PATH="$STUB_DIR:$BASE_PATH" HOME="$STUB_DIR" PUB_CACHE="$STUB_DIR/pub-cache" \
-        bash "$HOOK" 2>/dev/null) || true
-  if [ -z "$output" ]; then
+        bash "$HOOK" 2>/dev/null) || status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "exit:$status"
+  elif [ -z "$output" ]; then
     echo "aside"
   else
-    echo "$output" | jq -r '.hookSpecificOutput.permissionDecision'
+    echo "$output" | jq -r '.hookSpecificOutput.permissionDecision // "malformed"'
   fi
 }
 
